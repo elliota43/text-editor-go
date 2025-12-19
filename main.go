@@ -12,6 +12,13 @@ import (
 )
 
 const (
+	KEY_ESC       = '\x1b'
+	KEY_ENTER     = '\r'
+	KEY_BACKSPACE = 127
+	KeyTab        = '\t'
+)
+
+const (
 	ARROW_UP = iota + 1000
 	ARROW_DOWN
 	ARROW_LEFT
@@ -21,6 +28,11 @@ const (
 type Editor struct {
 	Cx, Cy        int
 	Width, Height int
+	Rows          []string
+}
+
+func ctrlKey(char rune) rune {
+	return char & 0x1f
 }
 
 func NewEditor(width, height int) *Editor {
@@ -29,6 +41,7 @@ func NewEditor(width, height int) *Editor {
 		Cy:     0,
 		Width:  width,
 		Height: height,
+		Rows:   []string{""},
 	}
 }
 
@@ -51,7 +64,13 @@ func (e *Editor) RefreshScreen() {
 func (e *Editor) drawRows(b *strings.Builder) {
 	for y := 0; y < e.Height-1; y++ {
 		b.WriteString("\x1b[K") // Clear line
-		b.WriteString("~")
+
+		if y < len(e.Rows) {
+			b.WriteString(e.Rows[y])
+		} else {
+			b.WriteString("~")
+		}
+
 		if y < e.Height-2 {
 			b.WriteString("\r\n")
 		}
@@ -67,6 +86,101 @@ func (e *Editor) drawStatus(b *strings.Builder) {
 
 	// Invert colors (styling)
 	b.WriteString(fmt.Sprintf("\x1b[7m Cursor: %d, %d \x1b[m", e.Cx, e.Cy))
+}
+
+func (e *Editor) handleEscapeSequence(r *bufio.Reader) {
+	// If it's aa sequence, peek at the next byte
+	next, _ := r.Peek(1)
+	if next[0] == '[' {
+		r.ReadByte()
+
+		// Read the finalizer byte (A, B, C, or D)
+		final, _ := r.ReadByte()
+		switch final {
+		case 'A':
+			if e.Cy > 0 {
+				e.Cy--
+			}
+		case 'B':
+			if e.Cy < e.Height-2 {
+				e.Cy++
+			}
+		case 'C':
+
+			if e.Cx < e.Width-1 {
+				e.Cx++
+			}
+		case 'D':
+			if e.Cx > 0 {
+				e.Cx--
+			}
+		}
+	}
+}
+
+func (e *Editor) insertRowAtIndex(index int, text string) {
+	e.Rows = append(e.Rows, "")
+
+	// shift by 1 to make space for new row
+	copy(e.Rows[index+1:], e.Rows[index:])
+
+	e.Rows[index] = text
+}
+func (e *Editor) insertNewLine() {
+	if e.Cx == 0 {
+		// At start of line: insert empty row above
+		e.Rows = append(e.Rows[:e.Cy], append([]string{""}, e.Rows[e.Cy:]...)...)
+	} else {
+		// in the middle of line: split row and insert
+		// characters to the right of the cursor on the new line
+		row := e.Rows[e.Cy]
+		e.Rows[e.Cy] = row[:e.Cx]
+		newRow := row[e.Cx:]
+		e.insertRowAtIndex(e.Cy+1, newRow)
+	}
+
+	e.Cy++
+	e.Cx = 0
+}
+
+func (e *Editor) deleteChar() {
+	// check if cursor is at the beginning of a new/empty file
+	if e.Cy == 0 && e.Cx == 0 {
+		return
+	}
+
+	row := e.Rows[e.Cy]
+
+	if e.Cx > 0 {
+		// check in middle of the line (remove char to the left)
+		e.Rows[e.Cy] = row[:e.Cx-1] + row[e.Cx:]
+		e.Cx--
+	} else {
+		// at beginning of line (join w previous line)
+		prevRow := e.Rows[e.Cy-1]
+		e.Cx = len(prevRow)
+
+		e.Rows[e.Cy-1] = prevRow + row
+
+		e.Rows = append(e.Rows[:e.Cy], e.Rows[e.Cy+1:]...)
+	}
+}
+
+func (e *Editor) insertChar(char rune) {
+	for len(e.Rows) <= e.Cy {
+		e.Rows = append(e.Rows, "")
+	}
+
+	row := e.Rows[e.Cy]
+
+	// don't allow Cx to exceed row length when inserting
+	if e.Cx > len(row) {
+		e.Cx = len(row)
+	}
+
+	// [everything before] + [new char] + [everything after]
+	e.Rows[e.Cy] = row[:e.Cx] + string(char) + row[e.Cx:]
+	e.Cx++
 }
 
 func main() {
@@ -121,52 +235,27 @@ func main() {
 
 		// Process
 		switch char {
-		case 27: // The ESC byte
-			// Check if there is more data immediately available
+		case KEY_ESC: // The ESC byte
 			if reader.Buffered() == 0 {
-				// just the scape key
-				fmt.Printf("\r\nPressed: ESC")
-				return
-			}
-			// If it's aa sequence, peek at the next byte
-			next, _ := reader.Peek(1)
-			if next[0] == '[' {
-				reader.ReadByte()
-
-				// Read the finalizer byte (A, B, C, or D)
-				final, _ := reader.ReadByte()
-				switch final {
-				case 'A':
-					//fmt.Print("\r\nPressed: UP")
-					if editor.Cy > 0 {
-						editor.Cy--
-					}
-				case 'B':
-					//fmt.Print("\r\nPressed: DOWN")
-					if editor.Cy < editor.Height-2 {
-						editor.Cy++
-					}
-				case 'C':
-
-					if editor.Cx < editor.Width-1 {
-						editor.Cx++
-					}
-					//fmt.Print("\r\nPressed: RIGHT")
-				case 'D':
-					if editor.Cx > 0 {
-						editor.Cx--
-					}
-					//fmt.Print("\r\nPressed: LEFT")
-				}
+				continue
 			}
 
-		case 'q':
+			editor.handleEscapeSequence(reader)
+
+		case KEY_ENTER:
+			editor.insertNewLine()
+
+		case KEY_BACKSPACE:
+			editor.deleteChar()
+
+		case ctrlKey('q'):
 			os.Stdout.WriteString("\x1b[2J") // Clear screen
 			os.Stdout.WriteString("\x1b[H")  // Reset cursor
-			return                           //Exit loop
+
+			return // exit
 
 		default:
-			fmt.Printf("\r\nRead: %d (char: %c)", char, char)
+			editor.insertChar(char)
 		}
 	}
 }
