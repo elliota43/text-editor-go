@@ -29,6 +29,9 @@ type Editor struct {
 	Cx, Cy        int
 	Width, Height int
 	Rows          []string
+	RowOffset     int
+	ColOffset     int
+	Filename      string
 }
 
 func ctrlKey(char rune) rune {
@@ -45,28 +48,73 @@ func NewEditor(width, height int) *Editor {
 	}
 }
 
+func (e *Editor) Scroll() {
+	// if cursor is above visible window, scroll up
+	if e.Cy < e.RowOffset {
+		e.RowOffset = e.Cy
+	}
+
+	// if cursor is below visible window, scroll down
+	// (Height-1 bc last row is status bar)
+	if e.Cy >= e.RowOffset+(e.Height-1) {
+		e.RowOffset = e.Cy - (e.Height - 2)
+	}
+
+	// Horizontal Scroll Left
+	if e.Cx < e.ColOffset {
+		e.ColOffset = e.Cx
+	}
+
+	// Horiz. Scroll Right
+	if e.Cx >= e.ColOffset+e.Width {
+		e.ColOffset = e.Cx - e.Width + 1
+	}
+
+}
+
 func (e *Editor) RefreshScreen() {
+	e.Scroll()
 	var b strings.Builder
 
 	b.WriteString("\x1b[?25l") // Hide cursor (avoids flickering effect)
 	b.WriteString("\x1b[H")    // Move to 1,1
 
-	e.drawRows(&b)
-	e.drawStatus(&b)
+	e.DrawRows(&b)
+	e.DrawStatus(&b)
 
 	// move cursor to where the user is
-	b.WriteString(fmt.Sprintf("\x1b[%d;%dH", e.Cy+1, e.Cx+1))
+	b.WriteString(fmt.Sprintf("\x1b[%d;%dH", (e.Cy-e.RowOffset)+1, (e.Cx-e.ColOffset)+1))
 
 	b.WriteString("\x1b[?25h") // show cursor again
 	os.Stdout.WriteString(b.String())
 }
 
-func (e *Editor) drawRows(b *strings.Builder) {
+func (e *Editor) DrawRows(b *strings.Builder) {
 	for y := 0; y < e.Height-1; y++ {
+
+		fileRowIndex := y + e.RowOffset
 		b.WriteString("\x1b[K") // Clear line
 
-		if y < len(e.Rows) {
-			b.WriteString(e.Rows[y])
+		if fileRowIndex < len(e.Rows) {
+			// draw the line from the buffer
+			line := e.Rows[fileRowIndex]
+
+			// skip characters to the left of ColOffset
+			if len(line) > e.ColOffset {
+				line = line[e.ColOffset:]
+			} else {
+				line = "" // entire line is scrolled off to the left
+			}
+
+			// trim characters beyond screen width
+			if len(line) > e.Width {
+				line = line[:e.Width]
+			}
+			b.WriteString(line)
+		} else if len(e.Rows) == 1 && e.Rows[0] == "" && y == e.Height/3 {
+			welcome := "GoEdit -- version 0.1"
+			padding := (e.Width - len(welcome)) / 2
+			b.WriteString(strings.Repeat(" ", padding) + welcome)
 		} else {
 			b.WriteString("~")
 		}
@@ -74,10 +122,11 @@ func (e *Editor) drawRows(b *strings.Builder) {
 		if y < e.Height-2 {
 			b.WriteString("\r\n")
 		}
+
 	}
 }
 
-func (e *Editor) drawStatus(b *strings.Builder) {
+func (e *Editor) DrawStatus(b *strings.Builder) {
 	// Move to the last line
 	b.WriteString(fmt.Sprintf("\x1b[%d;1H", e.Height))
 
@@ -88,7 +137,18 @@ func (e *Editor) drawStatus(b *strings.Builder) {
 	b.WriteString(fmt.Sprintf("\x1b[7m Cursor: %d, %d \x1b[m", e.Cx, e.Cy))
 }
 
-func (e *Editor) handleEscapeSequence(r *bufio.Reader) {
+func (e *Editor) snapCursorToText() {
+	rowLen := 0
+	if e.Cy < len(e.Rows) {
+		rowLen = len(e.Rows[e.Cy])
+	}
+
+	if e.Cx > rowLen {
+		e.Cx = rowLen
+	}
+}
+
+func (e *Editor) HandleEscapeSequence(r *bufio.Reader) {
 	// If it's aa sequence, peek at the next byte
 	next, _ := r.Peek(1)
 	if next[0] == '[' {
@@ -102,7 +162,7 @@ func (e *Editor) handleEscapeSequence(r *bufio.Reader) {
 				e.Cy--
 			}
 		case 'B':
-			if e.Cy < e.Height-2 {
+			if e.Cy < len(e.Rows)-1 {
 				e.Cy++
 			}
 		case 'C':
@@ -115,6 +175,8 @@ func (e *Editor) handleEscapeSequence(r *bufio.Reader) {
 				e.Cx--
 			}
 		}
+
+		e.snapCursorToText()
 	}
 }
 
@@ -126,7 +188,7 @@ func (e *Editor) insertRowAtIndex(index int, text string) {
 
 	e.Rows[index] = text
 }
-func (e *Editor) insertNewLine() {
+func (e *Editor) InsertNewLine() {
 	if e.Cx == 0 {
 		// At start of line: insert empty row above
 		e.Rows = append(e.Rows[:e.Cy], append([]string{""}, e.Rows[e.Cy:]...)...)
@@ -143,7 +205,7 @@ func (e *Editor) insertNewLine() {
 	e.Cx = 0
 }
 
-func (e *Editor) deleteChar() {
+func (e *Editor) DeleteChar() {
 	// check if cursor is at the beginning of a new/empty file
 	if e.Cy == 0 && e.Cx == 0 {
 		return
@@ -166,7 +228,7 @@ func (e *Editor) deleteChar() {
 	}
 }
 
-func (e *Editor) insertChar(char rune) {
+func (e *Editor) InsertChar(char rune) {
 	for len(e.Rows) <= e.Cy {
 		e.Rows = append(e.Rows, "")
 	}
@@ -181,6 +243,33 @@ func (e *Editor) insertChar(char rune) {
 	// [everything before] + [new char] + [everything after]
 	e.Rows[e.Cy] = row[:e.Cx] + string(char) + row[e.Cx:]
 	e.Cx++
+}
+
+func (e *Editor) Open(filename string) error {
+	// Read entire file into memory
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	// split content by newline characters into Rows slice
+	e.Rows = strings.Split(string(content), "\n")
+	e.Filename = filename
+	e.Cx = 0
+	e.Cy = 0
+	return nil
+}
+
+func (e *Editor) Save() error {
+	if e.Filename == "" {
+		// @TODO: save-as prompt
+		e.Filename = "goedit.txt"
+	}
+
+	output := strings.Join(e.Rows, "\n")
+
+	err := os.WriteFile(e.Filename, []byte(output), 0644)
+	return err
 }
 
 func main() {
@@ -219,6 +308,12 @@ func main() {
 
 	editor := NewEditor(width, height)
 
+	// Check if user specified a filename
+
+	if len(os.Args) > 1 {
+		editor.Open(os.Args[1])
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 
 	// Infinite loop to read bytes one by one
@@ -240,13 +335,13 @@ func main() {
 				continue
 			}
 
-			editor.handleEscapeSequence(reader)
+			editor.HandleEscapeSequence(reader)
 
 		case KEY_ENTER:
-			editor.insertNewLine()
+			editor.InsertNewLine()
 
 		case KEY_BACKSPACE:
-			editor.deleteChar()
+			editor.DeleteChar()
 
 		case ctrlKey('q'):
 			os.Stdout.WriteString("\x1b[2J") // Clear screen
@@ -254,8 +349,11 @@ func main() {
 
 			return // exit
 
+		case ctrlKey('s'):
+			editor.Save()
+
 		default:
-			editor.insertChar(char)
+			editor.InsertChar(char)
 		}
 	}
 }
